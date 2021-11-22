@@ -69,7 +69,7 @@ void Lock::unlock() {
 **/
 void entry_point(size_t nb, size_t id, Lock& lock) {
     ::printf("Hello from thread %lu/%lu\n", id, nb);
-    for (int i = 0; i < 10000; ++i) {
+    for (int i = 0; i < 1000000; ++i) {
         ::std::lock_guard<Lock> guard{lock}; // Lock is acquired here
         ::shared_access();
         // Lock is automatically released here (thanks to 'lock_guard', upon leaving the scope)

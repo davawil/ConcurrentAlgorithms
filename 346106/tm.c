@@ -22,6 +22,7 @@
 
 // External headers
 #include <pthread.h>
+#include <stdio.h>
 // Internal headers
 #include <tm.h>
 
@@ -130,12 +131,12 @@ typedef struct region{
 void region_clear_controls(shared_region_t *region){
     segment_t *seg = region->start;
     while(seg != NULL){
-        for (int i = 0; i < seg->size; ++i)
+        for (size_t i = 0; i < seg->size; ++i)
         {
             seg->bytes[i].control = 0;
             seg->bytes[i].accesses = 0;
             seg->bytes[i].access_set = NULL;
-            //TODO: SWAP READ-COPY AND WRITE-COPY
+            seg->bytes[i].read_copy = seg->bytes[i].write_copy;
         }
         seg = seg->next;
     }
@@ -152,20 +153,23 @@ void batcher_enter(shared_region_t *region, batcher_t *batcher){
         batcher->waiting_threads++;
         UNLOCK(&batcher->lock);
         //stops new threads while waiting threads are being woken up
-        while(!batcher->wakeups > 0){
+        while(!(batcher->wakeups > 0)){
         }
         //wait until batch is complete
         while(batcher->wakeups == 0){
         }
         LOCK(&batcher->lock);
         batcher->wakeups--;
-        LOCK(&batcher->lock);
+        UNLOCK(&batcher->lock);
     }
 }
 void batcher_leave(shared_region_t *region, batcher_t *batcher){
     LOCK(&batcher->lock);
     batcher->current_threads--;
+    printf("current threads: %d\n", batcher->current_threads);
+    printf("waiting threads: %d\n", batcher->waiting_threads);
     if(batcher->current_threads == 0){
+        printf("NEW BATCH\n");
         batcher->batch_num++;
         batcher->current_threads = batcher->waiting_threads;
         batcher->wakeups = batcher->waiting_threads;
@@ -252,7 +256,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     //check max size
 
     //allocate start segment
-    segment_t *start = malloc(sizeof(segment_t) + size * sizeof(d_byte_t));
+    segment_t *start = (segment_t *)malloc(sizeof(segment_t) + size * sizeof(d_byte_t));
     start->size = size;
     start->virtual_address = VIRTUAL_HEAP_START;
     start->next = NULL;
@@ -322,7 +326,7 @@ size_t tm_align(shared_t shared as(unused)) {
 **/
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     shared_region_t* region = (shared_region_t*)(shared);
-    transaction_t *t = malloc(sizeof(transaction_t));
+    transaction_t *t = (transaction_t *)malloc(sizeof(transaction_t));
     if(is_ro){
         t->access = READ_ONLY;
     }
@@ -330,6 +334,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
         t->access = READ_WRITE;
     }
     batcher_enter(region, &region->batcher);
+    printf("[%p] entered: \n", (void *)t);
     return (tx_t)t;
 }
 
@@ -342,6 +347,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     shared_region_t *region = (shared_region_t *)shared; 
     batcher_leave(region, &region->batcher);
     tx_t* t = (tx_t*)tx;
+    printf("[%p] left\n", (void *)t);
     free(t);
     return true;
 }
