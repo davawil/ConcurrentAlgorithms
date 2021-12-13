@@ -66,111 +66,11 @@
     #warning This compiler has no support for GCC attributes
 #endif
 
-// -------------------------------------------------------------------------- //
-
-#define REG_CTL_WR (1<<0)       //indicates wether bytes has been written to this epoch
-#define REG_CTL_RD (1<<1)       //indicates wether bytes as been read from this epoch
-#define REG_CTL_VALID (1<<2)    //indicates which copy holds the readable value (1=read_copy, 0=write_copy)
-#define BITS_48 0xFFFFFFFFFFFF
-#define SEG_PART(x) ((uint64_t)x >> 48)           //takes the 16 MSbs of x (segment part)
-#define BYTE_PART(x) ((uint64_t)x & BITS_48)     //isolates the 48 LSbs of x (byte part)
-#define MAKE_VIRTUAL(seg, byte) (virt_addr)(seg << 48 | (byte & BITS_48))
-//segments start from 0 in array while virtual address start from 1
-#define VIRTUAL_SEG(seg_offset) (v_addr)((uint64_t)(seg_offset + 1) << 48)  
-
-typedef pthread_mutex_t lock_t;
-typedef struct cond_variable {
-    pthread_mutex_t mutex;
-    pthread_cond_t cv;
-}cvar_t;
-#define LOCK(x) pthread_mutex_lock(x)
-#define UNLOCK(x) pthread_mutex_unlock(x)
-#define WAIT(x) pthread_cond_wait(&(x->cv), &(x->mutex))
-#define SIGNAL(x) pthread_cond_broadcast(&(x->cv))
-
-typedef struct transaction transaction_t;
-typedef struct segment segment_t;
-
-typedef struct duplicate_byte{
-    char control;                 //control array 
-    char write_copy;              //write array  
-    char read_copy;               //read array
-    lock_t lock;
-    int accesses;                 //number of accesses
-    transaction_t* access_set;    //the latest accessed transaction
-}d_byte_t;
-//OPTIMIZATION: make each element a range of bytes (for cache coherency)
-typedef struct duplicate_byte_list{
-    d_byte_t *self;
-    struct duplicate_byte_list *next;
-}d_byte_list_t;
-
-typedef struct segment_list{
-    segment_t *self;
-    struct segment_list *next;
-}seg_list_t;
-
-//internal implemention of tx_t
-//Each thread can only run one transaction AT A TIME
-struct transaction{
-    enum {READ_ONLY, READ_WRITE} access;
-    d_byte_list_t *writes;
-    seg_list_t *frees;
-};
-
-typedef struct transaction_list{
-    transaction_t self;
-    transaction_t *next;
-}tx_list_t;
-
-typedef struct batcher{
-    int batch_num;               //number of the current batch
-    int current_threads;         //number of threads in the current batch
-    int waiting_threads;         //number of threads that are blocked
-    int wakeups;                 //pending wakeups
-    lock_t lock;
-    pthread_cond_t cv;
-    tx_list_t *blocked;
-}batcher_t;
-
-typedef char* mem_location_t;
-
-#define THREAD_STATUS_BLOCKED 0
-#define THREAD_STATUS_RUNNING 1
-
-#define VIRTUAL_HEAP_START 0x00000001
-
-typedef void* v_addr;
-
-typedef struct segment{
-    //struct segment *prev;
-    //struct segment *next;
-    v_addr virtual_address;        //the virtual starting address of the segment
-    size_t size;
-    d_byte_t bytes[];      //array of bytes
-}segment_t;
-
-//Dynamic array of segments
-typedef struct segment_array{
-    size_t length;                  //number of segments in the array
-    size_t size;                    //maximum capacity of the array
-    segment_t **array;
-}seg_array_t;
-
-//each shared region has a virtual address space
-typedef struct region{
-    batcher_t batcher;
-    size_t alignment;
-    lock_t lock;
-    //segment_t *start;
-    seg_array_t segments;
-    d_byte_list_t *commits;
-    seg_list_t *deallocs;
-}shared_region_t;
-
+// GENERIC LISTS -------------------------------------------------------------------------- //
+typedef struct duplicate_byte d_byte_t;
 typedef enum{
-    LByte,
-    LSeg
+    TByte,
+    TSeg
 }LType;
 
 typedef struct linked_list_element{
@@ -186,6 +86,8 @@ typedef struct linked_list{
     element_t *first;
     element_t *last;
 }list_t;
+
+void print_list(list_t *l);
 
 list_t *list_new(LType type){
     list_t *list = (list_t *)malloc(sizeof(list_t));
@@ -210,6 +112,7 @@ void list_destroy(list_t *list){
         i = next;
     }
     pthread_mutex_destroy(&list->lock);
+    free(list);
 
 }
 /*concatenate list2 onto list1
@@ -217,36 +120,7 @@ void list_destroy(list_t *list){
 * after the operation list2 will be empty and list1 will contain list1 and list2
 * list2 should not be accessed concurrently with this operation
 */
-void list_concat(list_t *list1, list_t *list2){
-    if(list1->T != list2->T){
-        perror("list types do not match");
-        exit(EXIT_FAILURE);
-    }
-    if(list1 == NULL || list2 == NULL){
-        perror("list is null");
-        exit(EXIT_FAILURE);
-    }
-    //concatenate
-    pthread_mutex_lock(&list1->lock);
-    //if list1 is empty
-    if(list1->length == 0){
-        list1->first = list2->first;     
-    }
-    else{
-        list1->last->next = list2->first;   
-    }
-    //if list2 is not empty
-    if(list1->length > 0){
-        list1->last = list2->last;
-    }
-    
-    list1->length = list1->length + list2->length;
-    pthread_mutex_unlock(&list1->lock);
-    //empty list 2
-    list2->first = NULL;
-    list2->last = NULL;
-    list2->length = 0;
-}
+
 /*consumes the elements of a list as defined by the consume function
 * the consume function must free all resources within the element
 */
@@ -287,11 +161,21 @@ void list_append(LType T, list_t *list, void *element){
         exit(EXIT_FAILURE);
     }
     element_t *e = (element_t *)malloc(sizeof(element_t));
+    e->T = T;
     e->self = element;
     e->next = NULL;
     pthread_mutex_lock(&list->lock);
-    list->last->next = e;
-    list->last = e;
+    //printf("append:");
+    //print_list(list);
+    if (list->length == 0)
+    {
+        list->first = e;
+        list->last = e;
+    }
+    else{
+        list->last->next = e;
+        list->last = e;
+    }
     list->length++;
     pthread_mutex_unlock(&list->lock);
 }
@@ -306,6 +190,8 @@ void *list_pop(LType T, list_t *list){
         exit(EXIT_FAILURE);
     }
     pthread_mutex_lock(&list->lock);
+    //printf("pop:");
+    //print_list(list);
     if(list->length == 0){
         perror("cannot pop an empty list");
         exit(EXIT_FAILURE);
@@ -316,11 +202,169 @@ void *list_pop(LType T, list_t *list){
     free(list->first);
     list->first = next;
     list->length--;
+    if(list->length == 0)
+        list->last = NULL;
+    //printf("%ld\n", list->length);
     pthread_mutex_unlock(&list->lock);
 
     return e;
 }
-//ADD HEAD VALUE TO REDUCE TIME
+
+
+//TRANSACTIONAL MEMORY --------------------------------------------------------------------------- //
+#define REG_CTL_WR (1<<0)       //indicates wether bytes has been written to this epoch
+#define REG_CTL_RD (1<<1)       //indicates wether bytes as been read from this epoch
+#define REG_CTL_VALID (1<<2)    //indicates which copy holds the readable value (1=read_copy, 0=write_copy)
+#define BITS_48 0xFFFFFFFFFFFF
+#define SEG_PART(x) ((uint64_t)x >> 48)           //takes the 16 MSbs of x (segment part)
+#define BYTE_PART(x) ((uint64_t)x & BITS_48)     //isolates the 48 LSbs of x (byte part)
+#define MAKE_VIRTUAL(seg, byte) (virt_addr)(seg << 48 | (byte & BITS_48))
+//segments start from 0 in array while virtual address start from 1
+#define VIRTUAL_SEG(seg_offset) (v_addr)((uint64_t)(seg_offset + 1) << 48)  
+
+typedef pthread_mutex_t lock_t;
+typedef struct cond_variable {
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+}cvar_t;
+#define LOCK(x) pthread_mutex_lock(x)
+#define UNLOCK(x) pthread_mutex_unlock(x)
+#define WAIT(x) pthread_cond_wait(&(x->cv), &(x->mutex))
+#define SIGNAL(x) pthread_cond_broadcast(&(x->cv))
+
+typedef struct transaction transaction_t;
+typedef struct segment segment_t;
+
+typedef struct duplicate_byte{
+    char control;                 //control array 
+    char write_copy;              //write array  
+    char read_copy;               //read array
+    lock_t lock;
+    int accesses;                 //number of accesses
+    transaction_t* access_set;    //the latest accessed transaction
+}d_byte_t;
+
+void list_concat(list_t *list1, list_t *list2){
+    if(list1->T != list2->T){
+        perror("list types do not match");
+        exit(EXIT_FAILURE);
+    }
+    if(list1 == NULL || list2 == NULL){
+        perror("list is null");
+        exit(EXIT_FAILURE);
+    }
+
+    //concatenate
+    //printf("test\n");
+    pthread_mutex_lock(&list1->lock);
+    /*
+    if(list1->T == TByte){
+        printf("concat1:");
+        print_list(list1);
+        printf("\n");
+    }
+    */
+    //if list1 is empty
+    if(list1->length == 0){
+        list1->first = list2->first;     
+    }
+    else{
+        list1->last->next = list2->first;   
+    }
+    //if list2 is not empty
+    if(list2->length > 0){
+        list1->last = list2->last;
+    }
+    
+    list1->length = list1->length + list2->length;
+    /*
+    if(list1->T == TByte){
+        printf("concat2:");
+        print_list(list1);
+        printf("\n");
+    }*/
+    pthread_mutex_unlock(&list1->lock);
+    //empty list 2
+    list2->first = NULL;
+    list2->last = NULL;
+    list2->length = 0;
+    //if(list1->length > 0 && list1->T == TByte)
+        //printf("[%p]%p, %d\n",list1, list1->first, ((d_byte_t *)list1->first->self)->control);
+}
+//OPTIMIZATION: make each element a range of bytes (for cache coherency)
+/*
+typedef struct duplicate_byte_list{
+    d_byte_t *self;
+    struct duplicate_byte_list *next;
+}d_byte_list_t;
+
+typedef struct segment_list{
+    segment_t *self;
+    struct segment_list *next;
+}seg_list_t;
+*/
+//internal implemention of tx_t
+//Each thread can only run one transaction AT A TIME
+struct transaction{
+    enum {READ_ONLY, READ_WRITE} access;
+    //d_byte_list_t *writes;
+    //seg_list_t *frees;
+    list_t *writes;
+    list_t *frees;
+};
+/*
+typedef struct transaction_list{
+    transaction_t self;
+    transaction_t *next;
+}tx_list_t;
+*/
+typedef struct batcher{
+    int batch_num;               //number of the current batch
+    int current_threads;         //number of threads in the current batch
+    int waiting_threads;         //number of threads that are blocked
+    int wakeups;                 //pending wakeups
+    lock_t lock;
+    pthread_cond_t cv;
+    //tx_list_t *blocked;
+}batcher_t;
+
+typedef char* mem_location_t;
+
+#define THREAD_STATUS_BLOCKED 0
+#define THREAD_STATUS_RUNNING 1
+
+#define VIRTUAL_HEAP_START 0x00000001
+
+typedef void* v_addr;
+
+typedef struct segment{
+    //struct segment *prev;
+    //struct segment *next;
+    v_addr virtual_address;        //the virtual starting address of the segment
+    size_t size;
+    d_byte_t bytes[];      //array of bytes
+}segment_t;
+
+//Dynamic array of segments
+typedef struct segment_array{
+    size_t length;                  //number of segments in the array
+    size_t size;                    //maximum capacity of the array
+    segment_t **array;
+}seg_array_t;
+
+//each shared region has a virtual address space
+typedef struct region{
+    batcher_t batcher;
+    size_t alignment;
+    lock_t lock;
+    //segment_t *start;
+    seg_array_t segments;
+    //d_byte_list_t *commits;
+    //seg_list_t *deallocs;
+    list_t *commits;
+    list_t *deallocs;
+}shared_region_t;
+/*
 int byte_list_append(d_byte_list_t *list, d_byte_t *byte){
     if(list == NULL || byte == NULL)
         return -1;
@@ -363,12 +407,11 @@ int seg_list_append(seg_list_t *list, segment_t *seg){
     }
     list->next = element;
     return 1;
-}
+}*/
 //OPTIMIZATION: CLEAR ONLY WRITTEN BYTES
 void region_clear_controls(shared_region_t *region){
     for (size_t i = 0; i < region->segments.length; ++i)
     {
-
         segment_t *seg = region->segments.array[i];
         //printf("phys:[%p] virt:[%p]\n", (void *)seg, seg->virtual_address);
         //printf("[%p] -> [%p]\n", (void *)&seg->bytes[0], (void *)&seg->bytes[seg->size]);
@@ -417,16 +460,18 @@ void batcher_enter(batcher_t *batcher){
     //printf("[%d] entered: \n", gettid());
     UNLOCK(&batcher->lock);
 }
-void batcher_leave(shared_region_t *region as(unused), batcher_t *batcher, transaction_t *t as(unused), bool abort as(unused)){
+void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transaction_t *t as(unused), bool abort as(unused)){
     LOCK(&batcher->lock);
     batcher->current_threads--;
     //printf("[%d] left: %d \n", gettid(), batcher->current_threads);
     //printf("current threads: %d\n", batcher->current_threads);
     //printf("waiting threads: %d\n", batcher->waiting_threads);
     //printf("[%d] left : current : %d \n", gettid(),batcher->current_threads);
-    if(batcher->current_threads == 0){  
+    if(batcher->current_threads == 0){
+        //printf("NEW BACTH\n");
         //commit all valid writes of this batch
         //LOCK(&region->lock);
+        /*
         d_byte_list_t *commit = region->commits;
         while(commit != NULL){
             commit->self->read_copy = commit->self->write_copy;
@@ -441,18 +486,18 @@ void batcher_leave(shared_region_t *region as(unused), batcher_t *batcher, trans
         while(dealloc != NULL){
             //re-attach links
             segment_t *seg = dealloc->self;
-            /*
+            
             segment_t *prev = seg->prev;
             segment_t *next = seg->next;
             prev->next = next;
             if(next != NULL)
                 next->prev = prev;
-            */
+            
             for(size_t i = 0; i <seg->size; i++)
                 pthread_mutex_destroy(&seg->bytes[i].lock);
 
             int seg_off = SEG_PART(seg->virtual_address)-1;
-            /*
+            
             //HERE I COULD MINIMIZE THE ARRAY BY REORGANIZING IT; 
             //BUT THEN THEIR VIRTUAL ADDRESS WILL BE OUTDATED, AND IF I UPDATE IT THE GRADER WILL HAVE AN OUTDATED ADDRESS
             region->segments.length--;
@@ -460,16 +505,43 @@ void batcher_leave(shared_region_t *region as(unused), batcher_t *batcher, trans
             {
                 region->segments.array[i] = region->segments.array[i+1];
             }
-            */
+            
             region->segments.array[seg_off] = NULL;
             free(seg);
 
             seg_list_t *elem_next = dealloc->next;
             free(dealloc);
             dealloc = elem_next;
+        }*/
+        //printf("size: %ld\n", reg->commits->length);
+        while(reg->commits->length > 0)
+        {
+            //printf("%ld\n", i);
+            d_byte_t *byte = (d_byte_t *)list_pop(TByte, reg->commits);
+            byte->read_copy = byte->write_copy;
         }
-        region->deallocs = NULL;
-        region_clear_controls(region);
+        //printf("commits: [%p][%p]",reg->commits->first,reg->commits->last);
+        while(reg->commits->length > 0)
+        {
+            segment_t *seg = (segment_t *)list_pop(TSeg, reg->deallocs);
+            //remove segment from array
+            int seg_off = SEG_PART(seg->virtual_address)-1;
+            reg->segments.array[seg_off] = NULL;
+            //destroy the locks in each byte
+            for(size_t i = 0; i <seg->size; i++)
+                pthread_mutex_destroy(&seg->bytes[i].lock);
+            free(seg);
+        }
+        /*
+            seg_list_t *elem_next = dealloc->next;
+            free(dealloc);
+            dealloc = elem_next;
+        */
+        //region->deallocs = NULL;
+        region_clear_controls(reg);
+        //printf("commit: \n");
+        //print_list(reg->commits);
+        //printf("\n");
 
         //printf("NEW BATCH\n");
         batcher->batch_num++;
@@ -598,8 +670,8 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->segments.length = 1;
     region->segments.array = (segment_t **)malloc(sizeof(segment_t *)*region->segments.size);
     region->segments.array[0] = start;
-    region->commits = NULL;
-    region->deallocs = NULL;
+    region->commits = list_new(TByte);
+    region->deallocs = list_new(TSeg);
     pthread_mutex_init(&region->lock, NULL);
     
     return (shared_t)(region);
@@ -618,28 +690,35 @@ void tm_destroy(shared_t shared as(unused)) {
         free(i);
         i = next;
     }*/
+    //free all segments
     for(size_t i = 0; i < region->segments.size; i++){
         segment_t *seg = region->segments.array[i];
-        for (size_t i = 0; i < seg->size; ++i)
-        {
-            pthread_mutex_destroy(&seg->bytes[i].lock);
-        }
-        free(seg);
+        if(seg != NULL){
+            for (size_t i = 0; i < seg->size; ++i)
+            {
+                pthread_mutex_destroy(&seg->bytes[i].lock);
+            }
+            free(seg);    
+        }      
     }
     //free uncommited writes
+    list_destroy(region->commits);
+    /*
     d_byte_list_t *c = region->commits;
     while(c!=NULL){
         d_byte_list_t *next = c->next;
         free(c);
         c = next;
-    }
+    }*/
     //free uncommited frees
+    list_destroy(region->deallocs);
+    /*
     seg_list_t *d = region->deallocs;
     while(d!=NULL){
         seg_list_t *next = d->next;
         free(d);
         d = next;
-    }
+    }*/
 
     pthread_mutex_destroy(&region->batcher.lock);
     pthread_cond_destroy(&region->batcher.cv);
@@ -685,8 +764,8 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     shared_region_t* region = (shared_region_t*)(shared);
     transaction_t *t = (transaction_t *)malloc(sizeof(transaction_t));
 
-    t->writes = NULL;
-    t->frees = NULL;
+    t->writes = list_new(TByte);
+    t->frees = list_new(TSeg);
     if(is_ro){
         t->access = READ_ONLY;
     }
@@ -710,6 +789,13 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
 
     //defer commits of all the writes
     LOCK(&region->lock);
+    //add transaction writes to commits
+    list_concat(region->commits, t->writes);
+    list_destroy(t->writes);
+    //add transaction frees to deallocs
+    list_concat(region->deallocs, t->frees);
+    list_destroy(t->frees);
+    /*
     d_byte_list_t *commit = t->writes;
     //if no commits yet, copy writes to commits
     if(region->commits == NULL && commit != NULL){
@@ -750,7 +836,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
         seg_list_t *next = dealloc->next;
         free(commit);
         dealloc = next;
-    }   
+    }*/
     UNLOCK(&region->lock);
     
     //printf("[%p] ended\n", (void *)t);
@@ -964,6 +1050,8 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
     }
 
     //add free to transaction
+    list_append(TSeg, transaction->frees, (void *)seg);
+    /*
     int err = 0;
     if(transaction->frees == NULL){
         seg_list_t *element  = (seg_list_t *)malloc(sizeof(seg_list_t*));
@@ -977,7 +1065,7 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
     if(err == -1){
         perror("free : failed to append");
         exit(EXIT_FAILURE);
-    }
+    }*/
     printf("free: [%p]:[%p] success\n", (void *)tx, (void *)target);
     return true;
 }
@@ -1031,9 +1119,11 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
         }
     }
     UNLOCK(&byte->lock);
+    //printf("[%d]write\n", gettid());
 
     //add byte write to transaction
-    //printf("[%d]write\n", gettid());
+    list_append(TByte, transaction->writes, (void *)byte);
+    /*
     int err = 0;
     if(transaction->writes == NULL){
         d_byte_list_t *element  = (d_byte_list_t *)malloc(sizeof(d_byte_list_t*));
@@ -1048,6 +1138,7 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
         perror("failed to append");
         exit(EXIT_FAILURE);
     }
+    */
     return ret;
 }
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -1119,3 +1210,34 @@ bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte
     return ret;
 }
 
+void print_list(list_t *l){
+    if(l->T != TByte)
+        return;
+    printf("{length=%ld ,first=[%p], last=[%p]\n ", l->length, l->first, l->last);
+    //printf("{");
+    element_t *e1 = l->first;
+    if(e1 == NULL){
+            printf("NULL\n");
+    }
+    else{
+        d_byte_t *byte1 = (d_byte_t *)e1->self;
+        printf("\t{ctr=%d, wr=%d, rd=%d, acc=%d, set=[%p]}\n ", byte1->control, byte1->write_copy, byte1->read_copy, byte1->accesses, byte1->access_set);             
+        element_t *e2 = l->last;
+        d_byte_t *byte2 = (d_byte_t *)e2->self;
+        printf("\t{ctr=%d, wr=%d, rd=%d, acc=%d, set=[%p]}\n ", byte2->control, byte2->write_copy, byte2->read_copy, byte2->accesses, byte2->access_set);               
+    }
+    /*
+    for (size_t i = 0; i < l->length; ++i)
+    {
+        d_byte_t *byte = (d_byte_t *)e->self;
+        if(e == NULL){
+            printf("NULL");
+        }
+        else{
+                printf("{\tctr=%d, wr=%d, rd=%d, acc=%d, set=[%p]\n} ", byte->control, byte->write_copy, byte->read_copy, byte->accesses, byte->access_set);            
+        }
+    
+        e = e->next;
+    }*/
+    //printf("}}\n");
+}
