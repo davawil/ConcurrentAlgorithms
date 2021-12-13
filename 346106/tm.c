@@ -211,40 +211,6 @@ void *list_pop(LType T, list_t *list){
     return e;
 }
 
-
-//TRANSACTIONAL MEMORY --------------------------------------------------------------------------- //
-#define REG_CTL_WR (1<<0)       //indicates wether bytes has been written to this epoch
-#define REG_CTL_RD (1<<1)       //indicates wether bytes as been read from this epoch
-#define REG_CTL_VALID (1<<2)    //indicates which copy holds the readable value (1=read_copy, 0=write_copy)
-#define BITS_48 0xFFFFFFFFFFFF
-#define SEG_PART(x) ((uint64_t)x >> 48)           //takes the 16 MSbs of x (segment part)
-#define BYTE_PART(x) ((uint64_t)x & BITS_48)     //isolates the 48 LSbs of x (byte part)
-#define MAKE_VIRTUAL(seg, byte) (virt_addr)(seg << 48 | (byte & BITS_48))
-//segments start from 0 in array while virtual address start from 1
-#define VIRTUAL_SEG(seg_offset) (v_addr)((uint64_t)(seg_offset + 1) << 48)  
-
-typedef pthread_mutex_t lock_t;
-typedef struct cond_variable {
-    pthread_mutex_t mutex;
-    pthread_cond_t cv;
-}cvar_t;
-#define LOCK(x) pthread_mutex_lock(x)
-#define UNLOCK(x) pthread_mutex_unlock(x)
-#define WAIT(x) pthread_cond_wait(&(x->cv), &(x->mutex))
-#define SIGNAL(x) pthread_cond_broadcast(&(x->cv))
-
-typedef struct transaction transaction_t;
-typedef struct segment segment_t;
-
-typedef struct duplicate_byte{
-    char control;                 //control array 
-    char write_copy;              //write array  
-    char read_copy;               //read array
-    lock_t lock;
-    int accesses;                 //number of accesses
-    transaction_t* access_set;    //the latest accessed transaction
-}d_byte_t;
-
 void list_concat(list_t *list1, list_t *list2){
     if(list1->T != list2->T){
         perror("list types do not match");
@@ -292,18 +258,46 @@ void list_concat(list_t *list1, list_t *list2){
     //if(list1->length > 0 && list1->T == TByte)
         //printf("[%p]%p, %d\n",list1, list1->first, ((d_byte_t *)list1->first->self)->control);
 }
-//OPTIMIZATION: make each element a range of bytes (for cache coherency)
-/*
-typedef struct duplicate_byte_list{
-    d_byte_t *self;
-    struct duplicate_byte_list *next;
-}d_byte_list_t;
 
-typedef struct segment_list{
-    segment_t *self;
-    struct segment_list *next;
-}seg_list_t;
-*/
+//TRANSACTIONAL MEMORY --------------------------------------------------------------------------- //
+#define REG_CTL_WR (1<<0)       //indicates wether bytes has been written to this epoch
+#define REG_CTL_RD (1<<1)       //indicates wether bytes as been read from this epoch
+#define REG_CTL_VALID (1<<2)    //indicates which copy holds the readable value (1=read_copy, 0=write_copy)
+#define BITS_48 0xFFFFFFFFFFFF
+#define SEG_PART(x) ((uint64_t)x >> 48)           //takes the 16 MSbs of x (segment part)
+#define BYTE_PART(x) ((uint64_t)x & BITS_48)     //isolates the 48 LSbs of x (byte part)
+#define MAKE_VIRTUAL(seg, byte) (virt_addr)(seg << 48 | (byte & BITS_48))
+//segments start from 0 in array while virtual address start from 1
+#define VIRTUAL_SEG(seg_offset) (v_addr)((uint64_t)(seg_offset + 1) << 48)  
+
+typedef pthread_mutex_t lock_t;
+typedef struct cond_variable {
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+}cvar_t;
+#define LOCK(x) pthread_mutex_lock(x)
+#define UNLOCK(x) pthread_mutex_unlock(x)
+#define WAIT(x) pthread_cond_wait(&(x->cv), &(x->mutex))
+#define SIGNAL(x) pthread_cond_broadcast(&(x->cv))
+
+typedef struct transaction transaction_t;
+typedef struct segment segment_t;
+
+typedef struct duplicate_byte{
+    //char control;                 //control array 
+    char write_copy;              //write array  
+    char read_copy;               //read array
+    lock_t lock;
+    //int accesses;                 //number of accesses
+    //transaction_t* access_set;    //the latest accessed transaction
+}d_byte_t;
+
+typedef struct control_block{
+    char control;                 //control array 
+    int accesses;                 //number of accesses
+    transaction_t* access_set;    //the latest accessed transaction
+}ctl_block_t;
+
 //internal implemention of tx_t
 //Each thread can only run one transaction AT A TIME
 struct transaction{
@@ -313,12 +307,7 @@ struct transaction{
     list_t *writes;
     list_t *frees;
 };
-/*
-typedef struct transaction_list{
-    transaction_t self;
-    transaction_t *next;
-}tx_list_t;
-*/
+
 typedef struct batcher{
     int batch_num;               //number of the current batch
     int current_threads;         //number of threads in the current batch
@@ -343,6 +332,7 @@ typedef struct segment{
     //struct segment *next;
     v_addr virtual_address;        //the virtual starting address of the segment
     size_t size;
+    ctl_block_t *control;
     d_byte_t bytes[];      //array of bytes
 }segment_t;
 
@@ -416,12 +406,15 @@ void region_clear_controls(shared_region_t *region){
         segment_t *seg = region->segments.array[i];
         //printf("phys:[%p] virt:[%p]\n", (void *)seg, seg->virtual_address);
         //printf("[%p] -> [%p]\n", (void *)&seg->bytes[0], (void *)&seg->bytes[seg->size]);
+        /*
         for (size_t j = 0; j < seg->size; ++j)
         {
             seg->bytes[j].control = 0;
             seg->bytes[j].accesses = 0;
             seg->bytes[j].access_set = NULL;
         }
+        */
+        memset(seg->control, 0, sizeof(ctl_block_t)*seg->size);
     }
     /*
     segment_t *seg = region->start;
@@ -461,6 +454,28 @@ void batcher_enter(batcher_t *batcher){
     //printf("[%d] entered: \n", gettid());
     UNLOCK(&batcher->lock);
 }
+void commit(shared_region_t *reg as(unused)){
+    while(reg->commits->length > 0)
+    {
+        //printf("%ld\n", i);
+        d_byte_t *byte = (d_byte_t *)list_pop(TByte, reg->commits);
+        byte->read_copy = byte->write_copy;
+    }
+    //printf("commits: [%p][%p]",reg->commits->first,reg->commits->last);
+    while(reg->commits->length > 0)
+    {
+        segment_t *seg = (segment_t *)list_pop(TSeg, reg->deallocs);
+        //remove segment from array
+        int seg_off = SEG_PART(seg->virtual_address)-1;
+        reg->segments.array[seg_off] = NULL;
+        //destroy the locks in each byte
+        for(size_t i = 0; i <seg->size; i++)
+            pthread_mutex_destroy(&seg->bytes[i].lock);
+        free(seg->control);
+        free(seg);
+    }
+
+}
 void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transaction_t *t as(unused), bool abort as(unused)){
     LOCK(&batcher->lock);
     batcher->current_threads--;
@@ -470,80 +485,13 @@ void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transact
     //printf("[%d] left : current : %d \n", gettid(),batcher->current_threads);
     if(batcher->current_threads == 0){
         //printf("NEW BACTH\n");
-        //commit all valid writes of this batch
-        //LOCK(&region->lock);
-        /*
-        d_byte_list_t *commit = region->commits;
-        while(commit != NULL){
-            commit->self->read_copy = commit->self->write_copy;
-            d_byte_list_t *next = commit->next;
-            free(commit);
-            commit = next;
-        }
-        region->commits = NULL;
-
-        //commit frees
-        seg_list_t *dealloc = region->deallocs;
-        while(dealloc != NULL){
-            //re-attach links
-            segment_t *seg = dealloc->self;
-            
-            segment_t *prev = seg->prev;
-            segment_t *next = seg->next;
-            prev->next = next;
-            if(next != NULL)
-                next->prev = prev;
-            
-            for(size_t i = 0; i <seg->size; i++)
-                pthread_mutex_destroy(&seg->bytes[i].lock);
-
-            int seg_off = SEG_PART(seg->virtual_address)-1;
-            
-            //HERE I COULD MINIMIZE THE ARRAY BY REORGANIZING IT; 
-            //BUT THEN THEIR VIRTUAL ADDRESS WILL BE OUTDATED, AND IF I UPDATE IT THE GRADER WILL HAVE AN OUTDATED ADDRESS
-            region->segments.length--;
-            for (size_t i = seg_off; i < region->segments.length; ++i)
-            {
-                region->segments.array[i] = region->segments.array[i+1];
-            }
-            
-            region->segments.array[seg_off] = NULL;
-            free(seg);
-
-            seg_list_t *elem_next = dealloc->next;
-            free(dealloc);
-            dealloc = elem_next;
-        }*/
         //printf("size: %ld\n", reg->commits->length);
-        while(reg->commits->length > 0)
-        {
-            //printf("%ld\n", i);
-            d_byte_t *byte = (d_byte_t *)list_pop(TByte, reg->commits);
-            byte->read_copy = byte->write_copy;
-        }
-        //printf("commits: [%p][%p]",reg->commits->first,reg->commits->last);
-        while(reg->commits->length > 0)
-        {
-            segment_t *seg = (segment_t *)list_pop(TSeg, reg->deallocs);
-            //remove segment from array
-            int seg_off = SEG_PART(seg->virtual_address)-1;
-            reg->segments.array[seg_off] = NULL;
-            //destroy the locks in each byte
-            for(size_t i = 0; i <seg->size; i++)
-                pthread_mutex_destroy(&seg->bytes[i].lock);
-            free(seg);
-        }
-        /*
-            seg_list_t *elem_next = dealloc->next;
-            free(dealloc);
-            dealloc = elem_next;
-        */
         //region->deallocs = NULL;
+        commit(reg);
         region_clear_controls(reg);
         //printf("commit: \n");
         //print_list(reg->commits);
         //printf("\n");
-
         //printf("NEW BATCH\n");
         batcher->batch_num++;
         batcher->current_threads = batcher->waiting_threads;
@@ -554,17 +502,13 @@ void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transact
         //UNLOCK(&region->lock);
     }
     UNLOCK(&batcher->lock);
-    /*
+    
     if(abort){
-        d_byte_list_t *wr = t->writes;
-        //free all writes in transaction
-        while(wr != NULL){
-            d_byte_list_t *next = wr->next;
-            free(wr);
-            wr = next;
-        }
-    }*/
-    //free(t);
+        transaction_t *transaction = (transaction_t *)t;
+        list_destroy(transaction->writes);
+        list_destroy(transaction->frees);
+        free(t);
+    }
 }
 
 //MAKE CONSTANT TIME
@@ -589,21 +533,6 @@ d_byte_t *get_phys_addr(shared_region_t *region, v_addr virt_addr){
     d_byte_t *ret = &seg->bytes[byte_offset];
     UNLOCK(&region->lock);
     return ret;
-    /*
-    segment_t *seg = region->start;
-    while(seg != NULL){
-        //if virt_addr is within address space of segment i,
-        if(virt_addr >= seg->virtual_address && virt_addr < seg->virtual_address + seg->size){
-            //translate virtual address to a bytes adress
-            size_t virt_offset = (size_t)(virt_addr - seg->virtual_address);
-            //size_t phys_alignment = sizeof(d_byte_t)*region->alignment;
-            return &(seg->bytes[virt_offset]);
-        }
-        seg = seg->next;
-    }
-    //printf("%p \n", virt_addr);
-    return NULL;
-    */
 }
 typedef struct semaphore{
     lock_t lock;
@@ -627,8 +556,8 @@ void semaphore_aquire(semaphore_t *s){
 
 /** Declarations of helper functions
 **/
-bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte, char const* target);
-bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte, char const* source);
+bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* target as(unused), ctl_block_t *control);
+bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* source as(unused), ctl_block_t *control);
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -650,6 +579,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
 
     //allocate first segment  
     segment_t *start = (segment_t *)malloc(sizeof(segment_t) + size * sizeof(d_byte_t));
+    start->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size);
     start->size = size;
     start->virtual_address = VIRTUAL_SEG(0);
     //start->next = NULL;
@@ -699,6 +629,7 @@ void tm_destroy(shared_t shared as(unused)) {
             {
                 pthread_mutex_destroy(&seg->bytes[i].lock);
             }
+            free(seg->control);
             free(seg);    
         }      
     }
@@ -848,99 +779,6 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
-**/
-bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
-    //printf("read\n");
-    shared_region_t *region = (shared_region_t *)shared;
-    transaction_t *transaction = (transaction_t *)tx;
-    //check that size is a multiple of alignment
-    if(size%region->alignment != 0){
-        perror("bad alignetn");
-        exit(EXIT_FAILURE);
-    }
-
-    //get byte to read from
-    v_addr virt_addr = (v_addr)source;
-    d_byte_t *source_byte = get_phys_addr(shared, virt_addr);
-
-    if(source_byte == NULL){
-        //printf("(read %p)\n", virt_addr);
-        perror("read:null adress");
-        exit(EXIT_FAILURE);
-    }
-    char *target_byte = (char *)target;
-
-    for (size_t i = 0; i < size; ++i)
-    {
-        
-        bool cont = tm_read_byte(shared, tx, &source_byte[i], &target_byte[i]);
-        if(!cont)
-        {
-            //printf("read: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
-            batcher_leave(region, &region->batcher, transaction, true);
-            return false;
-        }
-        
-    }
-    //printf("read: [%p]:[%p] success\n", (void *)tx, (void*)virt_addr);
-    return true;
-}
-
-/** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in a private region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in the shared region)
- * @return Whether the whole transaction can continue
-**/
-//OPTIMIZE: ADD EACH WORD, INSTEAD OF BYTE, FOR COMMIT
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
-    //printf("write\n");
-    shared_region_t *region = (shared_region_t *)shared;
-    transaction_t *transaction = (transaction_t *)tx;
-
-    //check that size is a multiple of alignment
-    if(size%region->alignment != 0){
-        perror("bad alignment");
-        exit(EXIT_FAILURE);
-    }
-
-    v_addr virt_addr = (v_addr)target;
-
-    //printf("(write %p) : size %ld \n", virt_addr, region->start->size);
-    
-
-    d_byte_t *target_byte = get_phys_addr(region, virt_addr);
-    if(target_byte == NULL){
-        perror("write:null adress");
-        exit(EXIT_FAILURE);
-    }
-    //printf("write: [%p]:[%p]\n", target, target_byte);
-    
-    char *source_byte = (char *)source;
-
-    for (size_t i = 0; i < size; ++i)
-    { 
-        bool cont = tm_write_byte(shared, tx, &target_byte[i], &source_byte[i]);
-        if(!cont)
-        {   
-            //printf("write: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
-            batcher_leave(region, &region->batcher, transaction, true);
-            return false;
-        }
-    }
-    //printf("write: [%p]:[%p] success\n", (void *)tx, (void*)virt_addr);
-    return true;
-}
-
 /** [thread-safe] Memory allocation in the given transaction.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
@@ -969,21 +807,7 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
 
     
     LOCK(&region->lock);
-    /*
-    //find head segment of region
-    segment_t *head = region->start;
-    while(head->next != NULL){
-        head = head->next;
-    }
-    //add new segment to chain
-    head->next = seg;
-    //set segments fields
-    seg->next = NULL;
-    seg->prev = head;
-    seg->size = size;
-    //the virtual address of the new segment is the first available byte
-    seg->virtual_address = head->virtual_address + head->size;
-    */
+
     //if segment list is full, reallocate array
     if(region->segments.length > region->segments.size){
         region->segments.size *= 2;
@@ -997,6 +821,7 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
         region->segments.array = new_arr;
     }
     memset(&seg->bytes[0], 0, size*sizeof(d_byte_t));
+    seg->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size);
     seg->size = size;
     seg->virtual_address = VIRTUAL_SEG(region->segments.length);
 
@@ -1070,6 +895,53 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
     printf("free: [%p]:[%p] success\n", (void *)tx, (void *)target);
     return true;
 }
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in the shared region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in a private region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+    //printf("read\n");
+    shared_region_t *region = (shared_region_t *)shared;
+    transaction_t *transaction = (transaction_t *)tx;
+    //check that size is a multiple of alignment
+    if(size%region->alignment != 0){
+        perror("bad alignetn");
+        exit(EXIT_FAILURE);
+    }
+
+    //get byte to read from
+    v_addr virt_addr = (v_addr)source;
+    d_byte_t *source_byte = get_phys_addr(shared, virt_addr);
+
+    if(source_byte == NULL){
+        //printf("(read %p)\n", virt_addr);
+        perror("read:null adress");
+        exit(EXIT_FAILURE);
+    }
+    char *target_byte = (char *)target;
+    segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr) + i];
+        bool cont = tm_read_byte(shared, tx, &source_byte[i], &target_byte[i], ctl);
+        if(!cont)
+        {
+            //printf("read: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
+            batcher_leave(region, &region->batcher, transaction, true);
+            return false;
+        }
+        
+    }
+    //printf("read [%p]:%d\n", source, *(int *)target);
+    //printf("read: [%p]:[%p] success\n", (void *)tx, (void*)virt_addr);
+    return true;
+}
+
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
@@ -1078,7 +950,56 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* source as(unused)){
+//OPTIMIZE: ADD EACH WORD, INSTEAD OF BYTE, FOR COMMIT
+bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+    shared_region_t *region = (shared_region_t *)shared;
+    transaction_t *transaction = (transaction_t *)tx;
+
+    //check that size is a multiple of alignment
+    if(size%region->alignment != 0){
+        perror("bad alignment");
+        exit(EXIT_FAILURE);
+    }
+
+    v_addr virt_addr = (v_addr)target;
+
+    //printf("(write %p) : size %ld \n", virt_addr, region->start->size);
+    
+
+    d_byte_t *target_byte = get_phys_addr(region, virt_addr);
+    if(target_byte == NULL){
+        perror("write:null adress");
+        exit(EXIT_FAILURE);
+    }
+    segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
+    //printf("write: [%p]:[%p]\n", target, target_byte);
+    
+    char *source_byte = (char *)source;
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr) + i];
+        bool cont = tm_write_byte(shared, tx, &target_byte[i], &source_byte[i], ctl);
+        if(!cont)
+        {   
+            //printf("write: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
+            batcher_leave(region, &region->batcher, transaction, true);
+            return false;
+        }
+    }
+    //printf("write[%p]:%d\n",target, *(int *)source);
+    //printf("write: [%p]:[%p] success\n", (void *)tx, (void*)virt_addr);
+    return true;
+}
+/** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in a private region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in the shared region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* source as(unused), ctl_block_t *control){
     if((tx == invalid_tx) | (shared == invalid_shared))
         return false;
 
@@ -1090,9 +1011,9 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
 
     LOCK(&byte->lock);
     //if bytes has been written to already
-    if(byte->control & REG_CTL_WR){
+    if(control->control & REG_CTL_WR){
         //if it was written to/last read from by this transaction
-        if(byte->access_set == transaction){
+        if(control->access_set == transaction){
             //write to writable copy
             byte->write_copy = *source_pointer;
             ret = true;
@@ -1103,16 +1024,16 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
     }
     else{
         //if the bytes was accessed by some other transaction
-        if((byte->access_set != transaction && byte->access_set != NULL) || (byte->control & REG_CTL_RD) ){
+        if((control->access_set != transaction && control->access_set != NULL) || (control->control & REG_CTL_RD) ){
             ret = false;
         }
         else{
             //write to writable copy
             byte->write_copy = *source_pointer;
             //mark as written
-            byte->control |= REG_CTL_WR;
+            control->control |= REG_CTL_WR;
             //add to access set
-            byte->access_set = transaction;
+            control->access_set = transaction;
             //byte->control |= REG_CTL_RD;
             //shared_mem->bytes[index].accesses++;
             
@@ -1124,22 +1045,6 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
 
     //add byte write to transaction
     list_append(TByte, transaction->writes, (void *)byte);
-    /*
-    int err = 0;
-    if(transaction->writes == NULL){
-        d_byte_list_t *element  = (d_byte_list_t *)malloc(sizeof(d_byte_list_t*));
-        element->self = byte;
-        element->next = NULL;
-        transaction->writes = element;
-    }
-    else{
-       err = byte_list_append(transaction->writes, byte); 
-    }
-    if(err == -1){
-        perror("failed to append");
-        exit(EXIT_FAILURE);
-    }
-    */
     return ret;
 }
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -1149,7 +1054,7 @@ bool tm_write_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byt
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* target as(unused)){
+bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte as(unused), char const* target as(unused), ctl_block_t *control){
     
     if((tx == invalid_tx) | (shared == invalid_shared))
         return false;
@@ -1173,10 +1078,10 @@ bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte
     else{
         
         //if the bytes has been written to this epoch
-        if(byte->control & REG_CTL_WR){
+        if(control->control & REG_CTL_WR){
             //printf("if\n");
             //if the bytes was accessed by this transaction this epoch
-            if(byte->access_set == transaction){
+            if(control->access_set == transaction){
                 //printf("ifif\n");
                 //read wriateble copy
                 *target_byte = byte->write_copy;
@@ -1197,10 +1102,10 @@ bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte
             
             //return true;
             //mark that this has been read by another value
-            if(byte->access_set != transaction && byte->access_set != NULL)
-                byte->control |= REG_CTL_RD;
+            if(control->access_set != transaction && control->access_set != NULL)
+                control->control |= REG_CTL_RD;
             //add to access set
-            byte->access_set = transaction;
+            control->access_set = transaction;
             
             //shared_mem->bytes[index].accesses++;
             ret = true;
@@ -1210,7 +1115,7 @@ bool tm_read_byte(shared_t shared as(unused), tx_t tx as(unused), d_byte_t *byte
     UNLOCK(&byte->lock);
     return ret;
 }
-
+/*
 void print_list(list_t *l){
     if(l->T != TByte)
         return;
@@ -1227,7 +1132,7 @@ void print_list(list_t *l){
         d_byte_t *byte2 = (d_byte_t *)e2->self;
         printf("\t{ctr=%d, wr=%d, rd=%d, acc=%d, set=[%p]}\n ", byte2->control, byte2->write_copy, byte2->read_copy, byte2->accesses, byte2->access_set);               
     }
-    /*
+
     for (size_t i = 0; i < l->length; ++i)
     {
         d_byte_t *byte = (d_byte_t *)e->self;
@@ -1239,6 +1144,6 @@ void print_list(list_t *l){
         }
     
         e = e->next;
-    }*/
+    }
     //printf("}}\n");
-}
+}*/
