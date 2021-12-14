@@ -568,14 +568,13 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     //check that multiple of alignment
     if(size%align != 0)
         return invalid_shared;
-    //check if power of 2 by counting number of set bits
-    int set_bits = 0;
-    for(size_t i = 0; i< sizeof(size_t); i++){
-        set_bits += (align>>i) & 1;
-        if(set_bits > 1)
-            return invalid_shared;
-    }
+
+    //check power of two
+    if(align & (align - 1))
+        return invalid_shared;
+    
     //check max size
+    //printf("create\n");
 
     //allocate first segment  
     segment_t *start = (segment_t *)malloc(sizeof(segment_t) + size * sizeof(d_byte_t));
@@ -604,6 +603,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     region->commits = list_new(TByte);
     region->deallocs = list_new(TSeg);
     pthread_mutex_init(&region->lock, NULL);
+    //printf("create\n");
     
     return (shared_t)(region);
 }
@@ -612,6 +612,7 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared as(unused)) {
+    //printf("destroy\n");
     shared_region_t* region = (shared_region_t*)(shared);
     //free all segments
     /*
@@ -693,6 +694,7 @@ size_t tm_align(shared_t shared as(unused)) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
+    //printf("begin\n");
     shared_region_t* region = (shared_region_t*)(shared);
     transaction_t *t = (transaction_t *)malloc(sizeof(transaction_t));
 
@@ -716,6 +718,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
+    //printf("end\n");
     shared_region_t *region = (shared_region_t *)shared;
     transaction_t *t = (transaction_t*)tx;
 
@@ -787,6 +790,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(unused), void** target as(unused)) {
+    //printf("alloc\n");
     shared_region_t *region = (shared_region_t *)shared;
     transaction_t *transaction = (transaction_t*)tx;
 
@@ -840,7 +844,7 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
     //printf("(alloc (virtual) %p, size %ld \n)", *target, size);
 
     UNLOCK(&region->lock);
-    printf("alloc: [%p]:[%p] success\n", (void *)tx, (void*)seg);
+    //printf("alloc: [%p]:[%p] success\n", (void *)tx, (void*)seg);
     return success_alloc;
 }
 
@@ -851,6 +855,7 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unused)) {
+    //printf("free\n");
     shared_region_t *reg = (shared_region_t *)shared;
     transaction_t *transaction = (transaction_t*)tx;
 
@@ -892,7 +897,7 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
         perror("free : failed to append");
         exit(EXIT_FAILURE);
     }*/
-    printf("free: [%p]:[%p] success\n", (void *)tx, (void *)target);
+    //printf("free: [%p]:[%p] success\n", (void *)tx, (void *)target);
     return true;
 }
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -952,6 +957,7 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
 **/
 //OPTIMIZE: ADD EACH WORD, INSTEAD OF BYTE, FOR COMMIT
 bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source as(unused), size_t size as(unused), void* target as(unused)) {
+    //printf("write\n");
     shared_region_t *region = (shared_region_t *)shared;
     transaction_t *transaction = (transaction_t *)tx;
 
