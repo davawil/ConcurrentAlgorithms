@@ -127,7 +127,7 @@ void list_destroy(list_t *list){
 * the consume function must free all resources within the element
 */
 void list_consume(list_t *list, void (*consume (void *element))){
-    if(list == NULL){
+    if(unlikely(list == NULL)){
         perror("list is null");
         exit(EXIT_FAILURE);
     }
@@ -149,15 +149,15 @@ void list_consume(list_t *list, void (*consume (void *element))){
 }
 /*append a generic element to a list*/
 void list_append(LType T, list_t *list, void *element){
-    if(list->T != T){
+    if(unlikely(list->T != T)){
         perror("appending wrong type");
         exit(EXIT_FAILURE);
     }
-    if(list == NULL){
+    if(unlikely(list == NULL)){
         perror("list is null");
         exit(EXIT_FAILURE);
     }
-    if (element == NULL)
+    if(unlikely(element == NULL))
     {
         perror("element is null");
         exit(EXIT_FAILURE);
@@ -183,18 +183,18 @@ void list_append(LType T, list_t *list, void *element){
 }
 /*pops the first element in the array*/
 void *list_pop(LType T, list_t *list){
-    if(list->T != T){
+    if(unlikely(list->T != T)){
         perror("appending wrong type");
         exit(EXIT_FAILURE);
     }
-    if(list == NULL){
+    if(unlikely(list == NULL)){
         perror("list is null");
         exit(EXIT_FAILURE);
     }
     pthread_mutex_lock(&list->lock);
     //printf("pop:");
     //print_list(list);
-    if(list->length == 0){
+    if(unlikely(list->length == 0)){
         perror("cannot pop an empty list");
         exit(EXIT_FAILURE);
     }
@@ -213,11 +213,11 @@ void *list_pop(LType T, list_t *list){
 }
 
 void list_concat(list_t *list1, list_t *list2){
-    if(list1->T != list2->T){
+    if(unlikely(list1->T != list2->T)){
         perror("list types do not match");
         exit(EXIT_FAILURE);
     }
-    if(list1 == NULL || list2 == NULL){
+    if(unlikely(list1 == NULL || list2 == NULL)){
         perror("list is null");
         exit(EXIT_FAILURE);
     }
@@ -272,12 +272,16 @@ void list_concat(list_t *list1, list_t *list2){
 #define VIRTUAL_SEG(seg_offset) (v_addr)((uint64_t)(seg_offset + 1) << 48)  
 
 typedef pthread_mutex_t lock_t;
+typedef pthread_rwlock_t rw_lock_t;
 typedef struct cond_variable {
     pthread_mutex_t mutex;
     pthread_cond_t cv;
 }cvar_t;
 #define LOCK(x) pthread_mutex_lock(x)
 #define UNLOCK(x) pthread_mutex_unlock(x)
+#define LOCK_WR(x) pthread_rwlock_wrlock(x)
+#define UNLOCK_RW(x) pthread_rwlock_unlock(x)
+#define LOCK_RD(x) pthread_rwlock_rdlock(x)
 #define WAIT(x) pthread_cond_wait(&(x->cv), &(x->mutex))
 #define SIGNAL(x) pthread_cond_broadcast(&(x->cv))
 
@@ -305,6 +309,7 @@ typedef struct duplicate_byte{
 #define CTRL_GET_TX(ctrl) ((int64_t)ctrl & CTRL_TX_MASK)
 #define CTRL_GET_EPOCH(ctrl) (((int64_t)ctrl & CTRL_EPOCH_MASK) >>32)
 typedef struct duplicate_word{
+    atomic_uint_least64_t ctrl;     
     //char control;                 //control array
     int64_t write_copy;              //write array  
     int64_t read_copy;               //read array
@@ -312,16 +317,16 @@ typedef struct duplicate_word{
     //int accesses;                 //number of accesses
     //transaction_t* access_set;    //the latest accessed transaction
 }d_word_t;
-
+/*
 typedef struct control_block{
-    atomic_uint_least64_t ctrl;
-    atomic_int epoch;
+    //atomic_uint_least64_t ctrl;
+    //atomic_int epoch;
     int last_epoch;               //last epoch this control block has been accessed
     char control;                 //control array 
     int accesses;                 //number of accesses
     transaction_t* access_set;    //the latest accessed transaction
 }ctl_block_t;
-
+*/
 //internal implemention of tx_t
 //Each thread can only run one transaction AT A TIME
 struct transaction{
@@ -355,22 +360,22 @@ typedef struct segment{
     //struct segment *next;
     v_addr virtual_address;        //the virtual starting address of the segment
     size_t size;
-    ctl_block_t *control;
-    d_word_t words[];      //array of bytes
+    //ctl_block_t *control;
+    d_word_t *words;
 }segment_t;
 
 //Dynamic array of segments
 typedef struct segment_array{
-    _Atomic size_t length;                  //number of segments in the array
-    _Atomic size_t size;                    //maximum capacity of the array
-    segment_t ** _Atomic array;
+    size_t length;                  //number of segments in the array
+    size_t size;                    //maximum capacity of the array
+    segment_t **array;
 }seg_array_t;
 
 //each shared region has a virtual address space
 typedef struct region{
     batcher_t batcher;
     size_t alignment;
-    lock_t lock;
+    rw_lock_t lock;
     //segment_t *start;
     seg_array_t segments;
     //d_byte_list_t *commits;
@@ -378,69 +383,27 @@ typedef struct region{
     list_t *commits;
     list_t *deallocs;
 }shared_region_t;
-/*
-int byte_list_append(d_byte_list_t *list, d_byte_t *byte){
-    if(list == NULL || byte == NULL)
-        return -1;
 
-    d_byte_list_t *element = (d_byte_list_t *)malloc(sizeof(d_byte_list_t));
-    if (element == NULL)
-        return -1;
-
-    element->self = byte;
-    element->next = NULL;
-    while(list->next != NULL){
-        //if reference to byte already exists, don't add it
-        if(list->self == byte)
-            return 1;
-
-        list = list->next;
-
-    }
-    list->next = element;
-    return 1;
-}
-//ADD HEAD VALUE TO REDUCE TIME
-int seg_list_append(seg_list_t *list, segment_t *seg){
-    if(list == NULL || seg == NULL)
-        return -1;
-
-    seg_list_t *element = (seg_list_t *)malloc(sizeof(seg_list_t));
-    if (element == NULL)
-        return -1;
-
-    element->self = seg;
-    element->next = NULL;
-    while(list->next != NULL){
-        //if reference to segment already exists, don't add it
-        if(list->self == seg)
-            return 1;
-
-        list = list->next;
-
-    }
-    list->next = element;
-    return 1;
-}*/
 //OPTIMIZATION: CLEAR ONLY WRITTEN BYTES
+/*
 void region_clear_controls(shared_region_t *region){
     for (size_t i = 0; i < region->segments.length; ++i)
     {
         segment_t *seg = region->segments.array[i];
         //printf("phys:[%p] virt:[%p]\n", (void *)seg, seg->virtual_address);
         //printf("[%p] -> [%p]\n", (void *)&seg->bytes[0], (void *)&seg->bytes[seg->size]);
-        /*
+        
         for (size_t j = 0; j < seg->size; ++j)
         {
             seg->bytes[j].control = 0;
             seg->bytes[j].accesses = 0;
             seg->bytes[j].access_set = NULL;
         }
-        */
+        
         if(seg != NULL)
             memset(seg->control, 0, sizeof(ctl_block_t)*seg->size/sizeof(int64_t));
     }
-    /*
+    
     segment_t *seg = region->start;
     while(seg != NULL){
         for (size_t i = 0; i < seg->size; ++i)
@@ -451,8 +414,8 @@ void region_clear_controls(shared_region_t *region){
             //seg->bytes[i].read_copy = seg->bytes[i].write_copy;
         }
         seg = seg->next;
-    }*/
-}
+    }
+}*/
 
 //transaction "thread" tries to enter a batch in "batcher"
 void batcher_enter(batcher_t *batcher){
@@ -515,7 +478,7 @@ void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transact
         //printf("size: %ld\n", reg->commits->length);
         //region->deallocs = NULL;
         commit(reg);
-        region_clear_controls(reg);
+        //region_clear_controls(reg);
         //printf("commit: \n");
         //print_list(reg->commits);
         //printf("\n");
@@ -525,8 +488,6 @@ void batcher_leave(shared_region_t *reg as(unused), batcher_t *batcher, transact
         batcher->waiting_threads = 0;
         //printf("waiting %d : current : %d \n", batcher->waiting_threads ,batcher->current_threads);
         pthread_cond_broadcast(&batcher->cv);
-        
-        //UNLOCK(&region->lock);
     }
     UNLOCK(&batcher->lock);
     
@@ -543,38 +504,37 @@ d_word_t *get_phys_addr(shared_region_t *region, v_addr virt_addr){
     size_t seg_offset = SEG_PART(virt_addr)-1;
     size_t byte_offset = BYTE_PART(virt_addr);
 
-    //LOCK(&region->lock);
-    if(seg_offset > region->segments.length){
+    LOCK_RD(&region->lock);
+    if(unlikely(seg_offset > region->segments.length)){
         perror("fail phys addr");
         exit(EXIT_FAILURE);
     }
-
     segment_t *seg = region->segments.array[seg_offset];
-    if(seg == NULL){
+    UNLOCK_RW(&region->lock);
+
+    if(unlikely(seg == NULL)){
         perror("address is not allocated");
         exit(EXIT_FAILURE);
     }
-    if(seg->deallocated){
+    if(unlikely(seg->deallocated)){
         perror("address has been freed");
         exit(EXIT_FAILURE);
     }
-
     /*
     if(&seg->words[byte_offset] < (d_byte_t *)0xfffff)
         printf("%ld, %ld \n", seg_offset, byte_offset);
     */
-    if(byte_offset > seg->size){
+    if(unlikely(byte_offset > seg->size)){
         perror("address is not allocated");
         exit(EXIT_FAILURE);
     }
-    //UNLOCK(&region->lock);
     d_word_t *ret = &seg->words[byte_offset/sizeof(int64_t)];
     return ret;
 }
 /** Declarations of helper functions
 **/
-bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* target as(unused), ctl_block_t *control);
-bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* source as(unused), ctl_block_t *control);
+bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* target as(unused));
+bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* source as(unused));
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -583,23 +543,30 @@ bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *wor
 **/
 shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     //check that multiple of alignment
-    if(size%align != 0)
+    if(unlikely(size%align != 0))
         return invalid_shared;
 
     //check power of two
-    if(align & (align - 1))
+    if(unlikely(align & (align - 1)))
         return invalid_shared;
     
     //check max size
     //printf("create\n");
 
     //allocate first segment  
-    segment_t *start = (segment_t *)malloc(sizeof(segment_t) + size/sizeof(int64_t)* sizeof(d_word_t));
-    start->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size/sizeof(int64_t));
+    segment_t *start = (segment_t *)malloc(sizeof(segment_t));
+    //void *v_words = (void *)start->words;
+    if(unlikely(posix_memalign((void **)(&start->words), align, size/sizeof(int64_t)*sizeof(d_word_t)))){
+        perror("memory allocation failed");
+        exit(EXIT_FAILURE);
+    }
+    //start->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size/sizeof(int64_t));
+    memset(start->words, 0, size/sizeof(int64_t)*sizeof(d_word_t));
+    //REMOVE THIS SAFE???
     for (size_t i = 0; i < size/sizeof(int64_t); ++i)
     {
-        atomic_init(&start->control[i].ctrl, 0);
-        //atomic_init(&start->control[i].epoch, 0);
+        atomic_init(&start->words[i].ctrl, 0);
+        //atomic_init(&start->control[i].ctrl, 0);
     }
     start->deallocated = false;
     start->size = size;
@@ -607,8 +574,6 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     //start->next = NULL;
     //start->prev = NULL;
     //allocate dynamic list of segments
-
-    memset(start->words, 0, size/sizeof(int64_t)*sizeof(d_word_t));
 
     //create batcher
     batcher_t batcher = {0};
@@ -619,13 +584,16 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused)) {
     shared_region_t *region = malloc(sizeof(shared_region_t));
     region->alignment = align;
     //region->start = start;
+    
     region->segments.size = 4;
     region->segments.length = 1;
     region->segments.array = (segment_t **)malloc(sizeof(segment_t *)*region->segments.size);
+    
     region->segments.array[0] = start;
     region->commits = list_new(TByte);
     region->deallocs = list_new(TSeg);
-    pthread_mutex_init(&region->lock, NULL);
+    pthread_rwlock_init(&region->lock, NULL);
+    //pthread_mutex_init(&region->lock, NULL);
     //printf("create\n");
     
     return (shared_t)(region);
@@ -654,7 +622,8 @@ void tm_destroy(shared_t shared as(unused)) {
         {
             pthread_mutex_destroy(&seg->words[i].lock);
         }*/
-        free(seg->control);
+        //free(seg->control);
+        free(seg->words);
         free(seg);          
     }
     //free uncommited writes
@@ -678,7 +647,7 @@ void tm_destroy(shared_t shared as(unused)) {
 
     pthread_mutex_destroy(&region->batcher.lock);
     pthread_cond_destroy(&region->batcher.cv);
-    pthread_mutex_destroy(&region->lock);
+    pthread_rwlock_destroy(&region->lock);
     free(region);
 }
 
@@ -755,6 +724,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused)) {
     list_destroy(t->frees);
     //UNLOCK(&region->lock);
     batcher_leave(region, &region->batcher, t, false);
+    free(t);
     //printf("end: [%p]\n", (void *)tx);
     return true;
 }
@@ -772,25 +742,31 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
     transaction_t *transaction = (transaction_t*)tx;
 
     //check that multiple of alignment
-    if(size% region->alignment != 0){
+    if(unlikely(size%region->alignment != 0)){
         printf("alloc: [%p] abort\n", (void *)tx);
         batcher_leave(region, &region->batcher, transaction, true);
         return abort_alloc;
     }
 
     //allocate a new segment
-    segment_t *seg = malloc(sizeof(segment_t) + size/sizeof(int64_t)*sizeof(d_word_t));
+    segment_t *seg = (segment_t *)malloc(sizeof(segment_t));
     //printf("(alloc %p, size %ld \n)", seg, size);
-    if(seg == NULL){
+    if(unlikely(seg == NULL)){
         printf("alloc: [%p]:[%p] nomem_alloc\n", (void *)tx, (void*)seg);
         return nomem_alloc;
     }
-
-    memset(&seg->words[0], 0, size/sizeof(int64_t)*sizeof(d_word_t));
-    seg->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size/sizeof(int64_t));
+    //void *v_words = (void *)seg->words;
+    if(unlikely(posix_memalign((void **)(&seg->words), region->alignment, size/sizeof(int64_t)*sizeof(d_word_t)))){
+        perror("memory allocation failed");
+        exit(EXIT_FAILURE);
+    }
+    //start->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size/sizeof(int64_t));
+    memset(seg->words, 0, size/sizeof(int64_t)*sizeof(d_word_t));
+    //seg->control = (ctl_block_t *)malloc(sizeof(ctl_block_t)*size/sizeof(int64_t));
+    //SAFE TO REMOVE THIS??
     for (size_t i = 0; i < size/sizeof(int64_t); ++i)
     {
-        atomic_init(&seg->control[i].ctrl, 0);
+        atomic_init(&seg->words[i].ctrl, 0);
         //atomic_init(&start->control[i].epoch, 0);
         //pthread_mutex_init(&seg->words[i].lock, NULL);
     }
@@ -802,10 +778,10 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
     *target = seg->virtual_address;
 
     
-    LOCK(&region->lock);
 
+    LOCK_WR(&region->lock);
     //if segment list is full, reallocate array
-    if(region->segments.length > region->segments.size){
+    if(region->segments.length == region->segments.size){
         region->segments.size *= 2;
         segment_t **new_arr = (segment_t **)malloc(sizeof(segment_t*)*region->segments.size);
         memcpy((void *)new_arr, (void *)&region->segments.array[0], sizeof(segment_t*)*region->segments.size);
@@ -822,15 +798,14 @@ alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(
     
     region->segments.array[region->segments.length] = seg;
     region->segments.length++;
-    
     //give address to target
     //*target = seg->virtual_address;
     
 
     //printf("(alloc (virtual) %p, size %ld \n)", *target, size);
 
-    UNLOCK(&region->lock);
-    //printf("alloc: [%p]:[%p] success\n", (void *)tx, (void*)seg);
+    UNLOCK_RW(&region->lock);
+    printf("alloc: [%p]:[%p] success\n", (void *)tx, (void*)seg);
     return success_alloc;
 }
 
@@ -861,7 +836,7 @@ bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void* target as(unu
         exit(EXIT_FAILURE);
     }
     */
-    if(reg->segments.array[0] == seg){
+    if(unlikely(reg->segments.array[0] == seg)){
         perror("may not free start");
         exit(EXIT_FAILURE);
     }
@@ -899,7 +874,7 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     shared_region_t *region = (shared_region_t *)shared;
     transaction_t *transaction = (transaction_t *)tx;
     //check that size is a multiple of alignment
-    if(size%region->alignment != 0){
+    if(unlikely(size%region->alignment != 0)){
         perror("bad alignetn");
         exit(EXIT_FAILURE);
     }
@@ -908,18 +883,18 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const* source 
     v_addr virt_addr = (v_addr)source;
     d_word_t *source_words = get_phys_addr(shared, virt_addr);
 
-    if(source_words == NULL){
+    if(unlikely(source_words == NULL)){
         //printf("(read %p)\n", virt_addr);
         perror("read:null adress");
         exit(EXIT_FAILURE);
     }
     int64_t *target_words = (int64_t *)target;
-    segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
+    //segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
 
     for (size_t i = 0; i < size/sizeof(int64_t); ++i)
     {
-        ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr)/sizeof(int64_t) + i];
-        bool cont = tm_read_word(shared, tx, &source_words[i], &target_words[i], ctl);
+        //ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr)/sizeof(int64_t) + i];
+        bool cont = tm_read_word(shared, tx, &source_words[i], &target_words[i]);
         if(!cont)
         {
             //printf("read: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
@@ -946,7 +921,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     transaction_t *transaction = (transaction_t *)tx;
 
     //check that size is a multiple of alignment
-    if(size%region->alignment != 0){
+    if(unlikely(size%region->alignment != 0)){
         perror("bad alignment");
         exit(EXIT_FAILURE);
     }
@@ -956,12 +931,12 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     //printf("(write %p) : size %ld \n", virt_addr, region->start->size);
     
     d_word_t *target_words = get_phys_addr(region, virt_addr);
-    if(target_words == NULL){
+    if(unlikely(target_words == NULL)){
         perror("write:null adress");
         exit(EXIT_FAILURE);
     }
     //printf("test\n");
-    segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
+    //segment_t *seg = region->segments.array[SEG_PART(virt_addr)-1];
     //printf("write: [%p]:[%p]\n", target, target_word);
     
     //printf("test\n");
@@ -970,8 +945,8 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
     for (size_t i = 0; i < size/sizeof(int64_t); ++i)
     {
         //printf("test\n");
-        ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr)/sizeof(int64_t) + i];
-        bool cont = tm_write_word(shared, tx, &target_words[i], &source_words[i], ctl);
+        //ctl_block_t *ctl = &seg->control[BYTE_PART(virt_addr)/sizeof(int64_t) + i];
+        bool cont = tm_write_word(shared, tx, &target_words[i], &source_words[i]);
         if(!cont)
         {   
             //printf("write: [%p]:[%p] abort\n", (void *)tx, (void*)virt_addr);
@@ -993,8 +968,8 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const* source
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* source as(unused), ctl_block_t *control){
-    if((tx == invalid_tx) | (shared == invalid_shared))
+bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* source as(unused)){
+    if(unlikely((tx == invalid_tx) | (shared == invalid_shared)))
         return false;
 
     shared_region_t *region = (shared_region_t *)shared;
@@ -1004,19 +979,19 @@ bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *wor
     
     
     uint64_t this_epoch = (uint64_t)region->batcher.batch_num;
-    uint64_t latest_ctrl = atomic_load(&control->ctrl);
+    uint64_t latest_ctrl = atomic_load(&word->ctrl);
     uint64_t latest_epoch = CTRL_GET_EPOCH(latest_ctrl);
     if(latest_epoch < this_epoch){
         uint64_t cleared = CTRL_SET(0, 0, this_epoch);
-        atomic_compare_exchange_strong(&control->ctrl, &latest_ctrl, cleared);
+        atomic_compare_exchange_strong(&word->ctrl, &latest_ctrl, cleared);
     }
     
     //bool ret;
     uint64_t exp_empty = CTRL_SET(0, 0, this_epoch);
     uint64_t exp_self = CTRL_SET(tx_id, CTRL_RD, this_epoch);
     uint64_t desired = CTRL_SET(tx_id, CTRL_WR, this_epoch);
-    atomic_compare_exchange_strong(&control->ctrl, &exp_empty, desired);                         //overwrite if empty        
-    bool success = atomic_compare_exchange_strong(&control->ctrl, &exp_self, desired);           //overwrite if read by self only
+    atomic_compare_exchange_strong(&word->ctrl, &exp_empty, desired);                         //overwrite if empty        
+    bool success = atomic_compare_exchange_strong(&word->ctrl, &exp_self, desired);           //overwrite if read by self only
     if (success || (CTRL_GET_TX(exp_self) == tx_id && CTRL_GET_ACC(exp_self) != CTRL_RD_MUL))    //if overwrite succeded or if this tx already accessed it and no other tx has read from it
     {
         word->write_copy = *source_pointer;
@@ -1080,10 +1055,10 @@ bool tm_write_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *wor
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* target as(unused), ctl_block_t *control){
+bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word as(unused), int64_t const* target as(unused)){
     //printf("read\n");
     
-    if((tx == invalid_tx) | (shared == invalid_shared))
+    if(unlikely((tx == invalid_tx) | (shared == invalid_shared)))
         return false;
 
     shared_region_t *region = (shared_region_t *)shared;
@@ -1099,16 +1074,16 @@ bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word
     }
     
     uint64_t this_epoch = (uint64_t)region->batcher.batch_num;
-    uint64_t latest_ctrl = atomic_load(&control->ctrl);
+    uint64_t latest_ctrl = atomic_load(&word->ctrl);
     uint64_t latest_epoch = CTRL_GET_EPOCH(latest_ctrl);
     if(latest_epoch < this_epoch){
         uint64_t cleared = CTRL_SET(0, 0, this_epoch);
-        atomic_compare_exchange_strong(&control->ctrl, &latest_ctrl, cleared);
+        atomic_compare_exchange_strong(&word->ctrl, &latest_ctrl, cleared);
     }
     
     uint64_t exp_empty = CTRL_SET(0, 0, this_epoch);;
     uint64_t desired = CTRL_SET(tx_id, CTRL_WR, this_epoch);
-    bool first = atomic_compare_exchange_strong(&control->ctrl, &exp_empty, desired);      //overwrites if empty
+    bool first = atomic_compare_exchange_strong(&word->ctrl, &exp_empty, desired);      //overwrites if empty
     if(first || CTRL_GET_TX(exp_empty) == tx_id){                                         //if was empty or occupied by this transaction
         *target_word = word->write_copy;                                                  
         return true;
@@ -1116,7 +1091,7 @@ bool tm_read_word(shared_t shared as(unused), tx_t tx as(unused), d_word_t *word
     else if(CTRL_GET_ACC(exp_empty)){                                                           //if other transaction was first but has not yet written
         uint64_t exp_read = CTRL_SET(CTRL_GET_TX(exp_empty), CTRL_RD, this_epoch);                           //expect that transaction has read only
         uint64_t desired_mread = CTRL_SET(CTRL_GET_TX(exp_empty), CTRL_RD_MUL, this_epoch);                  //update to multiple reads
-        bool success = atomic_compare_exchange_strong(&control->ctrl, &exp_read, desired_mread); //try to update
+        bool success = atomic_compare_exchange_strong(&word->ctrl, &exp_read, desired_mread); //try to update
         if(success || CTRL_GET_ACC(exp_read) == CTRL_RD_MUL){                                   //if update success or was already updated to multple reads
             *target_word = word->read_copy;                                           
             return true;
